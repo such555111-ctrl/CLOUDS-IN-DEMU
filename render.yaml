@@ -24,6 +24,15 @@ services:
         sync: false
       - key: REVIEWS_URL
         sync: false
+      # Реквизиты для оплаты переводом (показываются клиенту после оформления заказа). Пустое значение скрывает строку.
+      - key: PAY_PHONE
+        value: "+79505449249"
+      - key: PAY_BANK
+        value: Россельхозбанк
+      - key: PAY_ALT
+        value: МТС Деньги
+      - key: PAY_MANAGER
+        value: "@CLOUDS_IN_0"
       - key: PICKUP_POINTS
         value: ВМЗ (самовывоз)
       - key: SHOP_TIMEZONE

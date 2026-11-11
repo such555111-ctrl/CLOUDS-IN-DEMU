@@ -325,7 +325,7 @@
   .status-contacted{color:#7E16D5;border-color:#7E16D5;background:rgba(144,31,235,.12);}
   .status-courier{color:var(--gold);border-color:var(--gold);background:rgba(183,90,255,.1);}
   .status-done,.status-accepted{color:var(--ok);border-color:var(--ok);background:rgba(127,217,154,.1);}
-  .status-cancelled,.status-rejected{color:var(--danger);border-color:var(--danger);background:rgba(229,84,107,.1);}
+  .status-cancelled,.status-rejected,.status-payment_failed{color:var(--danger);border-color:var(--danger);background:rgba(229,84,107,.1);}
   .order-items{font-size:12px;color:var(--muted);margin:12px 0;line-height:1.7;position:relative;z-index:1;}
   .order-contact{font-size:13px;margin-top:8px;line-height:1.7;position:relative;z-index:1;}
   .order-contact a{color:var(--accent);text-decoration:none;font-weight:500;}
@@ -1220,7 +1220,49 @@ async function deleteProduct(id){
 // --- Orders ------------------------------------------------------------
 
 function statusLabel(s){
-  return { new:'Новый', contacted:'В обработке (связались)', accepted:'Принят', courier:'Передан курьеру', done:'Выполнен', rejected:'Отклонён', cancelled:'Отменён' }[s] || s;
+  return { new:'Новый', contacted:'В обработке (связались)', accepted:'Принят', courier:'Передан курьеру', done:'Выполнен', rejected:'Отклонён', cancelled:'Отменён', payment_failed:'Оплата не подтверждена' }[s] || s;
+}
+
+// --- Оплата: способ, статус, время изменения, чек ---
+const PAY_METHOD_NAME = { transfer:'Перевод по реквизитам', cash:'Наличными при встрече' };
+const PAY_STATUS_NAME = { awaiting_receipt:'Ожидает чек', pending:'Чек получен, ожидает проверки', confirmed:'Оплата подтверждена', not_confirmed:'Оплата не подтверждена', cash:'Наличными при встрече' };
+
+function paymentBlockHTML(o){
+  const p = o.payment;
+  if (!p) return '';
+  const when = p.status_changed_at ? new Date(p.status_changed_at).toLocaleString('ru-RU') : '';
+  const color = p.status === 'confirmed' ? 'var(--lime)' : (p.status === 'not_confirmed' ? 'var(--danger)' : 'var(--text)');
+  const hist = (p.history && p.history.length > 1)
+    ? `<details style="margin-top:4px;"><summary class="card-sub" style="cursor:pointer;">История оплаты (${p.history.length})</summary><div class="card-sub" style="line-height:1.7;">${p.history.map(h => `${new Date(h.at).toLocaleString('ru-RU')} — <b>${PAY_STATUS_NAME[h.status] || h.status}</b>`).join('<br>')}</div></details>`
+    : '';
+  return `<div class="card-sub" style="color:var(--text);line-height:1.7;">💳 ${PAY_METHOD_NAME[p.method] || p.method}`
+    + (p.method === 'transfer' ? ` · <b style="color:${color};">${PAY_STATUS_NAME[p.status] || p.status}</b>` : '')
+    + (when && p.method === 'transfer' ? ` <span class="muted">(с ${when})</span>` : '')
+    + `</div>`
+    + (p.receipt_id ? `<button class="btn-outline" data-receipt="${o.id}" style="margin:6px 0;">🧾 Посмотреть чек</button>` : '')
+    + hist;
+}
+
+// чек открывается только с паролем админки: загружаем файл и показываем во всплывающем окне
+async function viewReceipt(id, btn){
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Загрузка...';
+  try {
+    const res = await fetch(`/api/admin/orders/${id}/receipt`, { headers: { 'X-Admin-Password': pwd } });
+    if (!res.ok){ let m = 'Не удалось загрузить чек'; try { m = (await res.json()).error || m; } catch(e){} throw new Error(m); }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const isImg = blob.type.startsWith('image/');
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.85);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;';
+    wrap.innerHTML = (isImg
+        ? `<img src="${url}" alt="Чек" style="max-width:100%;max-height:78vh;border-radius:10px;background:#fff;">`
+        : `<a href="${url}" download="receipt-CD${id}.pdf" style="color:#fff;font-size:15px;">⬇ Скачать чек (PDF)</a>`)
+      + `<button class="btn-outline" style="min-width:140px;">Закрыть</button>`;
+    wrap.onclick = e => { if (e.target === wrap || e.target.tagName === 'BUTTON'){ URL.revokeObjectURL(url); wrap.remove(); } };
+    document.body.appendChild(wrap);
+  } catch(e){ showToast(e.message); }
+  finally { btn.disabled = false; btn.textContent = old; }
 }
 
 function refreshOrdersBadge(){
@@ -1253,7 +1295,8 @@ function renderOrders(){
         <span class="status-badge status-${o.status}">${statusLabel(o.status)}</span>
       </div>
       <div class="order-items">${(o.items||[]).map(i=>(i.flavor ? `${i.name} — вкус: <b>${vEsc(i.flavor)}</b> × <b>${i.qty}</b>` : `${i.name} (${i.size||'—'}) × ${i.qty}`) + (i.profit != null ? ` <span class="muted">· закупка ${fmt(i.cost_price)} · прибыль ${fmt(i.unit_profit)}/шт. = <b style="color:${i.profit < 0 ? 'var(--danger)' : 'var(--lime)'};">${fmt(i.profit)}</b></span>` : ` <span class="muted">· закупка не указана</span>`)).join('<br>')}</div>
-      ${o.delivery ? `<div class="card-sub" style="color:var(--text);line-height:1.7;">${o.delivery.mode==='delivery' ? '🚚 Доставка: '+(o.delivery.district ? o.delivery.district+', ' : '')+(o.delivery.address||'—')+' (+'+fmt(o.delivery.fee||0)+')'+(o.delivery.payment_method ? '<br>💳 '+({prepay:'Предоплата',courier:'Оплата курьеру по договорённости'}[o.delivery.payment_method]||o.delivery.payment_method) : '') : '📍 Самовывоз: '+(o.delivery.point||'—')}<br>${o.delivery.asap ? '⚡ Как можно скорее' : '🕒 '+(o.delivery.date||'').split('-').reverse().slice(0,2).join('.')+' в '+(o.delivery.time||'')}</div>` : ''}
+      ${o.delivery ? `<div class="card-sub" style="color:var(--text);line-height:1.7;">${o.delivery.mode==='delivery' ? '🚚 Доставка: '+(o.delivery.district ? o.delivery.district+', ' : '')+(o.delivery.address||'—')+' (+'+fmt(o.delivery.fee||0)+')'+(o.delivery.payment_method && !o.payment ? '<br>💳 '+({prepay:'Предоплата',courier:'Оплата курьеру по договорённости'}[o.delivery.payment_method]||o.delivery.payment_method) : '') : '📍 Самовывоз: '+(o.delivery.point||'—')}<br>${o.delivery.asap ? '⚡ Как можно скорее' : '🕒 '+(o.delivery.date||'').split('-').reverse().slice(0,2).join('.')+' в '+(o.delivery.time||'')}</div>` : ''}
+      ${paymentBlockHTML(o)}
       ${o.discount ? `<div class="card-sub">Промокод: ${o.promo_code} (−${fmt(o.discount)}) · Сумма товаров: ${fmt(o.subtotal)}</div>` : ''}
       <div class="card-sub">Итого: ${fmt(o.total)}</div>
       <div class="card-sub">Общая прибыль по заказу: <b style="color:${o.profit_total < 0 ? 'var(--danger)' : 'var(--lime)'};">${fmt(o.profit_total)}</b>${o.profit_complete ? '' : ' <span class="muted">(без товаров с неуказанной закупкой)</span>'}</div>
@@ -1268,7 +1311,7 @@ function renderOrders(){
       </details>` : ''}
       <div class="order-actions">
         <select class="order-status-select" data-status="${o.id}">
-          ${['new','accepted','courier','done','cancelled'].concat(['new','accepted','courier','done','cancelled'].includes(o.status) ? [] : [o.status]).map(s=>`<option value="${s}" ${s===o.status?'selected':''}>${statusLabel(s)}</option>`).join('')}
+          ${(o.payment && o.payment.method==='transfer' ? ['new','accepted','courier','done','cancelled','payment_failed'] : ['new','accepted','courier','done','cancelled']).concat((o.payment && o.payment.method==='transfer' ? ['new','accepted','courier','done','cancelled','payment_failed'] : ['new','accepted','courier','done','cancelled']).includes(o.status) ? [] : [o.status]).map(s=>`<option value="${s}" ${s===o.status?'selected':''}>${statusLabel(s)}</option>`).join('')}
         </select>
       </div>
       ${o.customer_chat_id
@@ -1283,6 +1326,9 @@ function renderOrders(){
 
   list.querySelectorAll('[data-status]').forEach(sel=>{
     sel.onchange = () => updateOrderStatus(Number(sel.dataset.status), sel.value);
+  });
+  list.querySelectorAll('[data-receipt]').forEach(btn=>{
+    btn.onclick = () => viewReceipt(Number(btn.dataset.receipt), btn);
   });
   list.querySelectorAll('[data-loy-for]').forEach(btn=>{
     btn.onclick = () => openLoyaltyFor(Number(btn.dataset.loyFor));
@@ -1411,7 +1457,7 @@ async function sendQuestionMessage(id){
 let sales = null;
 
 let districts = null;
-const PAY_OPTS = { both:'Оба варианта', prepay:'Только предоплата', courier:'Только оплата курьеру' };
+const PAY_OPTS = { both:'Оба способа (перевод и наличные)', prepay:'Только перевод по реквизитам', courier:'Только наличные при встрече' };
 const payOptionsHTML = cur => Object.entries(PAY_OPTS).map(([k,t]) => `<option value="${k}"${k===cur?' selected':''}>${t}</option>`).join('');
 
 function renderDistricts(){

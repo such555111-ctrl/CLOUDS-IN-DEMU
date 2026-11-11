@@ -397,7 +397,7 @@
   .status-contacted{color:#7E16D5;border-color:#7E16D5;background:rgba(144,31,235,.12);}
   .status-courier{color:var(--gold);border-color:var(--gold);background:rgba(183,90,255,.1);}
   .status-done,.status-accepted{color:var(--lime);border-color:var(--lime);background:rgba(127,217,154,.1);}
-  .status-cancelled,.status-rejected{color:var(--danger);border-color:var(--danger);background:rgba(229,84,107,.1);}
+  .status-cancelled,.status-rejected,.status-payment_failed{color:var(--danger);border-color:var(--danger);background:rgba(229,84,107,.1);}
   .order-items{font-size:13px;color:var(--muted);line-height:1.8;margin:8px 0 6px;}
   .order-total{display:flex;justify-content:space-between;align-items:baseline;font-size:14px;margin-top:10px;padding-top:12px;border-top:1px solid var(--line-soft);}
   .order-total b{color:var(--gold);font-family:var(--font-heading);font-size:17px;font-weight:900;}
@@ -1046,6 +1046,19 @@
     background:rgba(183,90,255,.08);border:1.5px solid rgba(183,90,255,.3);text-align:center;}
   .success-loy.show{display:block;}
   .success-loy b{color:var(--gold);}
+  /* оплата переводом: реквизиты и загрузка чека */
+  .pay-box{margin:14px 0 6px;padding:13px 14px;border-radius:14px;border:1.5px solid rgba(183,90,255,.3);background:rgba(183,90,255,.07);text-align:left;font-size:13px;line-height:1.5;}
+  .pay-sum{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--line);}
+  .pay-sum b{font-size:18px;color:var(--gold);}
+  .pay-row{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;padding:3px 0;}
+  .pay-row span{color:var(--muted);font-size:12px;}
+  .pay-row b,.pay-row a{color:var(--text);font-weight:700;}
+  .pay-copy{margin-left:auto;background:transparent;border:1.5px solid var(--line);color:var(--text);border-radius:9px;padding:5px 10px;font-size:11px;cursor:pointer;}
+  .pay-upload{margin-top:12px;display:flex;flex-direction:column;gap:9px;}
+  .pay-file{width:100%;font-size:12px;color:var(--muted);padding:8px;border:1.5px dashed var(--line);border-radius:12px;background:var(--bg);box-sizing:border-box;}
+  .pay-note{margin-top:8px;font-size:11.5px;color:var(--muted);line-height:1.5;}
+  .pay-done{padding:6px 0;font-size:13px;line-height:1.6;color:var(--text);}
+  .order-pay{font-size:12px;color:var(--text);line-height:1.6;margin:0 0 8px;}
   @media (prefers-reduced-motion:reduce){.loy-pill.show,.loy-block.show{animation:none;}.loy-switch,.loy-switch::after,.loy-old{transition:none;}.cart-total b.flash,.co-summary div.tot b.flash{animation:none;}}
 
   /* ===================== CLOUDS IN DEMU · база ===================== */
@@ -1748,10 +1761,6 @@
         <div class="label" style="margin-top:14px;">Район доставки</div>
         <select id="coDistrict" class="text-input"></select>
       </div>
-      <div id="coPaymentWrap" style="display:none;">
-        <div class="label" style="margin-top:14px;">Способ оплаты</div>
-        <div class="sizes" id="coPayment" style="margin-bottom:6px;"></div>
-      </div>
       <div class="label" style="margin-top:14px;">Адрес доставки</div>
       <textarea id="coAddress" class="text-input" style="min-height:64px;" placeholder="Улица, дом, подъезд, этаж, квартира"></textarea>
       <div id="coFreeHint" style="display:none;margin-top:8px;font-size:12.5px;font-weight:600;color:var(--accent-soft);"></div>
@@ -1766,6 +1775,10 @@
       <input type="date" id="coDate" class="text-input">
       <input type="time" id="coTime" class="text-input">
     </div>
+
+    <div class="label" style="margin-top:15px;">Способ оплаты</div>
+    <div class="sizes" id="coPayMethods" style="margin-bottom:6px;"></div>
+    <div class="pay-note" id="coPayHint" style="margin:0 0 4px;"></div>
 
     <div class="label" style="margin-top:15px;">Комментарий к заказу</div>
     <textarea id="coComment" class="text-input" placeholder="Вкус, цвет, пожелания (необязательно)"></textarea>
@@ -1793,8 +1806,9 @@
     <div class="success-icon">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12l6 6L20 6"/></svg>
     </div>
-    <div class="success-title">Заказ оформлен</div>
-    <div class="success-sub">Мы свяжемся с вами в этом чате, чтобы подтвердить заказ и обсудить доставку.<br>Номер заказа: <span id="orderNo"></span></div>
+    <div class="success-title" id="successTitle">Заказ оформлен</div>
+    <div class="success-sub"><i id="successMsg" style="font-style:normal;">Мы свяжемся с вами в этом чате, чтобы подтвердить заказ и обсудить доставку.</i><br>Номер заказа: <span id="orderNo"></span></div>
+    <div id="successPay"></div>
     <div class="success-loy" id="successLoy"></div>
     <button class="btn-secondary" data-close>Продолжить покупки</button>
   </div>
@@ -2943,7 +2957,7 @@ document.getElementById('favBtn').onclick = () => { renderFavorites(); openSheet
 document.getElementById('profileBtn').onclick = () => { openSheet('profileSheet'); renderProfile(); };
 
 // --- профиль и история заказов -----------------------------------------
-const ORDER_STATUS_LABEL = { new:'Новый', contacted:'В обработке', accepted:'Принят', courier:'Передан курьеру', done:'Выполнен', rejected:'Отклонён', cancelled:'Отменён' };
+const ORDER_STATUS_LABEL = { new:'Новый', contacted:'В обработке', accepted:'Принят', courier:'Передан курьеру', done:'Выполнен', rejected:'Отклонён', cancelled:'Отменён', payment_failed:'Оплата не подтверждена' };
 
 function renderProfile(){
   const user = tgUser();
@@ -3000,6 +3014,9 @@ function renderOrders(orders){
     const date = new Date(o.created_at).toLocaleString('ru-RU', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
     const itemsText = (o.items||[]).map(i => `${i.name} (${i.size||'—'}) × ${i.qty}`).join('<br>');
     const canCancel = o.status === 'new';
+    const pay = o.payment;
+    const payLine = pay ? `<div class="order-pay">💳 ${PAYMENT_LABELS[pay.method] || pay.method}${pay.method === 'transfer' ? ' · <b>' + (PAY_STATUS_LABEL[pay.status] || pay.status) + '</b>' : ''}</div>` : '';
+    const needReceipt = pay && pay.method === 'transfer' && pay.status === 'awaiting_receipt' && (o.status === 'new' || o.status === 'contacted');
     return `
       <div class="order-card" data-oid="${o.id}">
         <div class="order-head">
@@ -3010,10 +3027,12 @@ function renderOrders(orders){
           <div class="order-status status-${o.status}">${ORDER_STATUS_LABEL[o.status] || o.status}</div>
         </div>
         <div class="order-items">${itemsText}</div>
-        ${o.delivery ? `<div class="order-dlv">${deliveryLine(o.delivery)}</div>` : ''}
+        ${o.delivery ? `<div class="order-dlv">${deliveryLine(o.delivery, !!pay)}</div>` : ''}
+        ${payLine}
         ${o.delivery && o.delivery.fee ? `<div class="order-total" style="font-size:11px;color:var(--muted);padding:0;"><span>Доставка</span><span>${fmt(o.delivery.fee)}</span></div>` : ''}
         ${o.discount > 0 ? `<div class="order-total" style="font-size:11px;color:var(--muted);padding:0;"><span>Промокод ${o.promo_code||''}</span><span>−${fmt(o.discount)}</span></div>` : ''}
         <div class="order-total"><span>Итого</span><b>${fmt(o.total)}</b></div>
+        ${needReceipt ? payBoxHTML(o.id, o.total, PAY_INFO) : ''}
         ${canCancel ? `<button class="order-cancel-btn" data-oid="${o.id}">Отменить заказ</button>` : ''}
       </div>
     `;
@@ -3022,6 +3041,7 @@ function renderOrders(orders){
   listEl.querySelectorAll('.order-cancel-btn').forEach(btn=>{
     btn.onclick = () => cancelOrder(Number(btn.dataset.oid), btn);
   });
+  listEl.querySelectorAll('.pay-box[data-pay-oid]').forEach(box => bindPayBox(box, Number(box.dataset.payOid), null));
 }
 
 function cancelOrder(oid, btn){
@@ -3044,6 +3064,7 @@ function cancelOrder(oid, btn){
       const statusEl = card.querySelector('.order-status');
       statusEl.className = 'order-status status-' + order.status;
       statusEl.textContent = ORDER_STATUS_LABEL[order.status];
+      card.querySelector('.pay-box')?.remove();
       btn.remove();
       showToast(`Заказ CD-${oid} отменён`, 'success');
       if (tg) tg.HapticFeedback?.notificationOccurred('success');
@@ -3128,7 +3149,25 @@ document.getElementById('qSubmitBtn').onclick = submitQuestion;
 
 // --- Оформление: самовывоз / доставка / время ---
 var coState = { mode:'pickup', point:null, when:'asap', district:null, payment:null };
-var PAYMENT_LABELS = { prepay:'Предоплата', courier:'Оплата курьеру по договорённости' };
+// способы оплаты: transfer — перевод по реквизитам (с ручным подтверждением), cash — наличные при встрече.
+// prepay/courier — старые настройки района, соответствуют transfer/cash
+var PAYMENT_LABELS = { transfer:'Перевод по реквизитам', cash:'Наличными при встрече', prepay:'Перевод по реквизитам', courier:'Наличными при встрече' };
+var PAY_STATUS_LABEL = { awaiting_receipt:'Ожидает чек', pending:'Чек получен, ожидает проверки', confirmed:'Оплата подтверждена', not_confirmed:'Оплата не подтверждена', cash:'Наличными при встрече' };
+var PAY_INFO = { phone:'', bank:'', alt:'', manager:'' };      // реквизиты приходят с сервера (/api/config и ответ на заказ)
+var RECEIPT_TOKENS = {};                                       // order_id → токен для загрузки чека (из ответа на оформление)
+
+// какие способы оплаты доступны: для доставки в район — только разрешённые районом
+function allowedPayMethods(){
+  const all = ['transfer', 'cash'];
+  if (coState.mode === 'delivery' && DISTRICTS.length){
+    const d = districtById(coState.district);
+    if (!d || !Array.isArray(d.payments)) return all;
+    const map = { prepay:'transfer', courier:'cash' };
+    const m = all.filter(x => d.payments.some(p => map[p] === x));
+    return m.length ? m : all;
+  }
+  return all;
+}
 
 function pad2(n){ return String(n).padStart(2,'0'); }
 function todayStr(){ const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; }
@@ -3183,14 +3222,15 @@ function renderCheckoutOpts(){
   dSel.innerHTML = '<option value="">Выберите район…</option>' + DISTRICTS.map(d =>
     `<option value="${d.id}">${escHtml(d.name)} — ${d.fee ? fmt(d.fee) : 'бесплатно'}</option>`).join('');
   dSel.value = coState.district === null ? '' : String(coState.district);
-  // способ оплаты: только доступные для выбранного района
-  const curD = districtById(coState.district);
-  const pays = curD && Array.isArray(curD.payments) ? curD.payments : [];
+  // способ оплаты: перевод по реквизитам или наличные при встрече (для района — только разрешённые)
+  const pays = allowedPayMethods();
   if (!pays.includes(coState.payment)) coState.payment = pays.length === 1 ? pays[0] : null;
-  document.getElementById('coPaymentWrap').style.display = pays.length ? '' : 'none';
-  const payBox = document.getElementById('coPayment');
-  payBox.innerHTML = pays.map(p => `<button type="button" class="size-btn ${p===coState.payment?'active':''}" data-pay="${p}">${PAYMENT_LABELS[p] || p}</button>`).join('');
+  const payBox = document.getElementById('coPayMethods');
+  payBox.innerHTML = pays.map(p => `<button type="button" class="size-btn ${p===coState.payment?'active':''}" data-pay="${p}">${PAYMENT_LABELS[p]}</button>`).join('');
   payBox.querySelectorAll('.size-btn').forEach(b => b.onclick = () => { coState.payment = b.dataset.pay; renderCheckoutOpts(); });
+  document.getElementById('coPayHint').textContent = coState.payment === 'transfer'
+    ? 'После оформления покажем реквизиты и сумму. Нужно прикрепить чек — менеджер проверит оплату и подтвердит заказ.'
+    : (coState.payment === 'cash' ? 'Оплата наличными при встрече. Менеджер свяжется с вами, чтобы согласовать время и место.' : '');
   document.getElementById('coPickupBox').style.display = coState.mode === 'pickup' ? '' : 'none';
   document.getElementById('coDeliveryBox').style.display = coState.mode === 'delivery' ? '' : 'none';
   document.getElementById('coTimeBox').style.display = coState.when === 'time' ? '' : 'none';
@@ -3216,9 +3256,9 @@ document.querySelectorAll('#coMode .seg-btn').forEach(b => b.onclick = () => { c
 document.querySelectorAll('#coWhen .seg-btn').forEach(b => b.onclick = () => { coState.when = b.dataset.when; renderCheckoutOpts(); });
 renderCheckoutOpts();
 
-function deliveryLine(d){
+function deliveryLine(d, skipPay){
   if (!d) return '';
-  const place = d.mode === 'delivery' ? `🚚 Доставка: ${d.district ? escHtml(d.district) + ', ' : ''}${d.address||'—'}${d.payment_method ? '<br>💳 ' + (PAYMENT_LABELS[d.payment_method] || d.payment_method) : ''}` : `📍 Самовывоз: ${d.point||'—'}`;
+  const place = d.mode === 'delivery' ? `🚚 Доставка: ${d.district ? escHtml(d.district) + ', ' : ''}${d.address||'—'}${d.payment_method && !skipPay ? '<br>💳 ' + (PAYMENT_LABELS[d.payment_method] || d.payment_method) : ''}` : `📍 Самовывоз: ${d.point||'—'}`;
   let when = '⚡ Как можно скорее';
   if (!d.asap && d.date){
     const [y,m,dd] = d.date.split('-');
@@ -3234,6 +3274,100 @@ document.getElementById('checkoutBtn').onclick = () => {
   loadDistricts();         // актуальные районы и цены
   openSheet('checkoutSheet');
 };
+
+// --- оплата переводом: реквизиты и чек ---
+function payBoxHTML(oid, total, info){
+  info = info || PAY_INFO || {};
+  const mgrName = String(info.manager || '').replace(/^@/, '');
+  return `<div class="pay-box" data-pay-oid="${oid}">
+    <div class="pay-sum"><span>Сумма к оплате</span><b>${fmt(total)}</b></div>
+    ${info.phone ? `<div class="pay-row"><span>Номер</span><b>${escHtml(info.phone)}</b><button type="button" class="pay-copy" data-copy="${escHtml(info.phone)}">Копировать</button></div>` : ''}
+    ${info.bank ? `<div class="pay-row"><span>Банк</span><b>${escHtml(info.bank)}</b></div>` : ''}
+    ${info.alt ? `<div class="pay-row"><span>Также доступен вариант</span><b>${escHtml(info.alt)}</b></div>` : ''}
+    ${mgrName ? `<div class="pay-row"><span>Менеджер</span><a href="https://t.me/${encodeURIComponent(mgrName)}" data-tglink="1" target="_blank" rel="noopener">@${escHtml(mgrName)}</a></div>` : ''}
+    <div class="pay-upload">
+      <input type="file" class="pay-file" accept="image/*,application/pdf">
+      <button type="button" class="btn-primary pay-send">Отправить чек</button>
+      <div class="form-error pay-err"></div>
+    </div>
+    <div class="pay-note">Прикрепите фото или файл чека (JPG, PNG, PDF). Менеджер проверит его вручную и подтвердит оплату — автоматически это не происходит. Чек можно также отправить прямо в чат с ботом.</div>
+  </div>`;
+}
+
+// фото чека с телефона сжимаем до разумного размера (читаемость сохраняется)
+async function shrinkReceipt(file){
+  const ok = ['image/jpeg','image/png','image/webp'].includes(file.type);
+  if (!file.type.startsWith('image/') || (ok && file.size < 1.5 * 1024 * 1024)) return file;
+  try {
+    const bmp = await createImageBitmap(file);
+    const k = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
+    const cv = document.createElement('canvas');
+    cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+    cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+    const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.88));
+    return blob && (!ok || blob.size < file.size) ? blob : file;
+  } catch(e){ return file; }
+}
+
+function bindPayBox(root, oid, token){
+  root.querySelectorAll('.pay-copy').forEach(b => b.onclick = async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); showToast('Номер скопирован', 'success'); }
+    catch(e){
+      const ta = document.createElement('textarea'); ta.value = b.dataset.copy; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); showToast('Номер скопирован', 'success'); } catch(_){}
+      ta.remove();
+    }
+  });
+  root.querySelectorAll('a[data-tglink]').forEach(a => a.onclick = e => {
+    if (tg?.openTelegramLink){ e.preventDefault(); tg.openTelegramLink(a.href); }
+  });
+  const fileEl = root.querySelector('.pay-file'), btn = root.querySelector('.pay-send'), err = root.querySelector('.pay-err');
+  btn.onclick = async () => {
+    err.textContent = '';
+    const f = fileEl.files && fileEl.files[0];
+    if (!f){ err.textContent = 'Выберите фото или файл чека'; return; }
+    btn.disabled = true; btn.textContent = 'Отправка...';
+    try {
+      const blob = await shrinkReceipt(f);
+      const fd = new FormData();
+      fd.append('file', blob, f.name || 'receipt.jpg');
+      const t = token || RECEIPT_TOKENS[oid];
+      if (t) fd.append('token', t);
+      const headers = tg && tg.initData ? { 'X-Telegram-Init-Data': tg.initData } : {};
+      const res = await fetch(`/api/orders/${oid}/receipt`, { method: 'POST', headers, body: fd });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error || 'Не удалось отправить чек');
+      delete RECEIPT_TOKENS[oid];
+      root.innerHTML = '<div class="pay-done">🧾 Чек отправлен. Менеджер проверит оплату и подтвердит заказ — мы сообщим вам в Telegram.</div>';
+      showToast('Чек отправлен менеджеру', 'success');
+      if (tg) tg.HapticFeedback?.notificationOccurred('success');
+      if (document.getElementById('profileSheet').classList.contains('open')) loadOrders();
+    } catch(e){
+      err.textContent = e.message;
+      btn.disabled = false; btn.textContent = 'Отправить чек';
+      if (tg) tg.HapticFeedback?.notificationOccurred('error');
+    }
+  };
+}
+
+function showOrderSuccess(data){
+  const isTransfer = data.pay_method === 'transfer';
+  if (data.payment_info) PAY_INFO = data.payment_info;
+  if (isTransfer && data.receipt_token) RECEIPT_TOKENS[data.order_id] = data.receipt_token;
+  document.getElementById('successTitle').textContent = isTransfer ? 'Осталось оплатить' : 'Заказ оформлен';
+  document.getElementById('successMsg').textContent = isTransfer
+    ? 'Заказ создан. Переведите сумму по реквизитам ниже и прикрепите чек — менеджер проверит оплату и подтвердит заказ.'
+    : (data.pay_method === 'cash'
+        ? 'Оплата наличными при встрече. Мы свяжемся с вами в этом чате, чтобы подтвердить заказ и обсудить доставку.'
+        : 'Мы свяжемся с вами в этом чате, чтобы подтвердить заказ и обсудить доставку.');
+  const box = document.getElementById('successPay');
+  if (isTransfer){
+    box.innerHTML = payBoxHTML(data.order_id, data.total, data.payment_info);
+    bindPayBox(box.querySelector('.pay-box'), data.order_id, data.receipt_token);
+  } else {
+    box.innerHTML = '';
+  }
+}
 
 async function submitOrder(){
   const nameEl = document.getElementById('coName');
@@ -3269,7 +3403,7 @@ async function submitOrder(){
   if (coState.mode === 'delivery' && DISTRICTS.length && !districtById(coState.district)){
     return fail('Выберите район доставки', document.getElementById('coDistrict'));
   }
-  if (coState.mode === 'delivery' && DISTRICTS.length && !coState.payment){
+  if (!coState.payment){
     return fail('Выберите способ оплаты', null);
   }
   if (coState.mode === 'delivery' && addrEl.value.trim().length < 5){
@@ -3296,11 +3430,11 @@ async function submitOrder(){
       point: coState.mode === 'pickup' ? coState.point : null,
       address: coState.mode === 'delivery' ? addrEl.value.trim() : null,
       district_id: coState.mode === 'delivery' ? coState.district : null,
-      payment_method: coState.mode === 'delivery' && DISTRICTS.length ? coState.payment : null,
       asap: coState.when === 'asap',
       date: coState.when === 'time' ? dateEl.value : null,
       time: coState.when === 'time' ? timeEl.value : null,
     },
+    pay_method: coState.payment,                   // transfer | cash
     promo_code: appliedPromo ? appliedPromo.code : undefined,
     points_to_spend: loyaltyCalc(subtotal - discount).spend,   // сколько баллов списать (0, если тумблер выключен)
     tg_user: tgUser ? { id: tgUser.id, username: tgUser.username } : null,
@@ -3318,6 +3452,7 @@ async function submitOrder(){
     }
     const data = await res.json();
     document.getElementById('orderNo').textContent = 'CD-' + data.order_id;
+    showOrderSuccess(data);
     const loyBox = document.getElementById('successLoy');
     if (Number.isFinite(data.points_balance)){
       loyaltyBalance = data.points_balance;
@@ -3339,9 +3474,9 @@ async function submitOrder(){
     document.getElementById('coPhone').value = '';
     document.getElementById('coComment').value = '';
     addrEl.value = ''; timeEl.value = '';
-    coState.when = 'asap'; coState.mode = 'pickup'; renderCheckoutOpts();
+    coState.when = 'asap'; coState.mode = 'pickup'; coState.payment = null; renderCheckoutOpts();
     openSheet('successSheet');
-    showToast('Заказ отправлен на обработку', 'success');
+    showToast(data.pay_method === 'transfer' ? 'Заказ создан — прикрепите чек об оплате' : 'Заказ отправлен на обработку', 'success');
     if (tg) tg.HapticFeedback?.notificationOccurred('success');
   } catch(e){
     errEl.textContent = e.message;
@@ -3438,6 +3573,7 @@ fetch('/api/config').then(r => r.ok ? r.json() : null).then(c => {
   if (c && Number.isFinite(c.max_points_percent)) LOYALTY.maxPercent = c.max_points_percent;
   if (c && Number.isFinite(c.cashback_percent)) LOYALTY.cashbackPercent = c.cashback_percent;
   if (c && Number.isFinite(c.point_value) && c.point_value > 0) LOYALTY.pointValue = c.point_value;
+  if (c && c.payment_info) PAY_INFO = c.payment_info;
   renderLoyaltyBadges();
   renderCheckoutOpts();
   updateCartTotals();

@@ -75,7 +75,7 @@ except ValueError:
 
 
 # Способы оплаты доставки: настраиваются для каждого района
-PAYMENT_LABELS = {"prepay": "Предоплата", "courier": "Оплата курьеру по договорённости"}
+PAYMENT_LABELS = {"prepay": "Перевод по реквизитам", "courier": "Наличными при встрече"}
 PAYMENT_MODES = ("prepay", "courier", "both")
 
 
@@ -101,6 +101,33 @@ def delivery_fee_for(goods_total, base_fee=None):
 PICKUP_POINTS = [
     p.strip() for p in (os.environ.get("PICKUP_POINTS") or "ВМЗ (самовывоз)").split(",") if p.strip()
 ]
+
+# ---------------------------------------------------------------------
+#  Оплата: перевод по реквизитам (с ручным подтверждением) и наличные при встрече
+# ---------------------------------------------------------------------
+# Реквизиты можно поменять переменными окружения без правки кода. Пустое значение скрывает строку.
+PAY_PHONE = (os.environ.get("PAY_PHONE", "+79505449249") or "").strip()
+PAY_BANK = (os.environ.get("PAY_BANK", "Россельхозбанк") or "").strip()
+PAY_ALT = (os.environ.get("PAY_ALT", "МТС Деньги") or "").strip()
+PAY_MANAGER = (os.environ.get("PAY_MANAGER", "@CLOUDS_IN_0") or "").strip()
+if PAY_MANAGER and not PAY_MANAGER.startswith("@"):
+    PAY_MANAGER = "@" + PAY_MANAGER
+
+PAY_TRANSFER, PAY_CASH = "transfer", "cash"
+PAY_METHOD_LABELS = {PAY_TRANSFER: "Перевод по реквизитам", PAY_CASH: "Наличными при встрече"}
+# статус оплаты: сохраняется в заказе вместе со временем изменения (order["payment"])
+PAY_STATUS_LABELS = {
+    "awaiting_receipt": "Ожидает чек",
+    "pending": "Чек получен, ожидает проверки",
+    "confirmed": "Оплата подтверждена",
+    "not_confirmed": "Оплата не подтверждена",
+    "cash": "Наличными при встрече",
+}
+# старые настройки района («Предоплата» / «Оплата курьеру») соответствуют новым способам оплаты
+DISTRICT_PAY_TO_METHOD = {"prepay": PAY_TRANSFER, "courier": PAY_CASH}
+METHOD_TO_DISTRICT_PAY = {v: k for k, v in DISTRICT_PAY_TO_METHOD.items()}
+
+RECEIPT_MAX_BYTES = 7 * 1024 * 1024        # чек: фото или PDF до 7 МБ
 
 # Программа лояльности: 1 балл = 1 рубль
 def _env_float(name, default):
@@ -313,6 +340,22 @@ class ProductRating(Base):
                          default=lambda: datetime.now(timezone.utc))
     updated_at  = Column(DateTime(timezone=True), nullable=False,
                          default=lambda: datetime.now(timezone.utc))
+
+
+class PaymentReceipt(Base):
+    """Чек об оплате переводом (фото или PDF) хранится прямо в базе (bytea).
+    Наружу публично не отдаётся: смотреть чек можно только в админ-панели и в сообщении админу в Telegram.
+    Таблица payment_receipts создаётся автоматически при запуске."""
+    __tablename__ = "payment_receipts"
+    id           = Column(Integer, primary_key=True)
+    order_id     = Column(Integer, nullable=False, index=True)
+    filename     = Column(String(120), nullable=False)
+    content_type = Column(String(64), nullable=False)
+    size         = Column(Integer, nullable=False, default=0)
+    data         = Column(LargeBinary, nullable=False)
+    uploaded_by  = Column(BigInteger)                     # Telegram ID отправителя (если известен)
+    created_at   = Column(DateTime(timezone=True), nullable=False,
+                          default=lambda: datetime.now(timezone.utc))
 
 
 # Отдельная фабрика сессий для данных магазина (не мешает сессиям отзывов).
@@ -1107,7 +1150,7 @@ def admin_product(p):
 
 def public_order(o):
     """Заказ для покупателя: без закупочных цен и прибыли."""
-    d = {k: v for k, v in o.items() if k not in ("profit_total", "profit_complete")}
+    d = {k: v for k, v in o.items() if k not in ("profit_total", "profit_complete", "receipt_token")}
     d["status_history"] = [{"status": h["status"], "label": h["label"], "at": h["at"]} for h in order_history(o)]
     d["items"] = [{k: v for k, v in i.items() if k not in ("cost_price", "unit_profit", "profit")}
                   if isinstance(i, dict) else i for i in (o.get("items") or [])]
@@ -1120,7 +1163,7 @@ def admin_order(o, cost_by_id=None):
     а для старых заказов (без снимка) — из текущей карточки товара. Данные в базу не пишутся."""
     if cost_by_id is None:
         cost_by_id = {p.get("id"): sanitize_cost_price(p.get("cost_price")) for p in load_products()}
-    d = dict(o)
+    d = {k: v for k, v in o.items() if k != "receipt_token"}
     items, total, complete = [], 0.0, True
     for i in (o.get("items") or []):
         if not isinstance(i, dict):
@@ -1224,7 +1267,7 @@ def compute_promo_discount(promo, subtotal):
 # courier — «передан курьеру»: как и «принят», товар уже списан со склада
 PENDING_STATUSES = {"new", "contacted"}
 ACCEPTED_STATUSES = {"accepted", "courier", "done"}
-CANCEL_STATUSES = {"rejected", "cancelled"}
+CANCEL_STATUSES = {"rejected", "cancelled", "payment_failed"}
 ALL_STATUSES = PENDING_STATUSES | ACCEPTED_STATUSES | CANCEL_STATUSES
 
 
@@ -1290,10 +1333,12 @@ def apply_order_status(o, target):
 ORDER_STATUS_TEXT = {
     "new": "новый", "contacted": "в обработке", "accepted": "принят", "courier": "передан курьеру",
     "done": "выполнен", "rejected": "отклонён", "cancelled": "отменён",
+    "payment_failed": "оплата не подтверждена",
 }
 STATUS_LABELS = {
     "new": "Новый", "contacted": "В обработке", "accepted": "Принят", "courier": "Передан курьеру",
     "done": "Выполнен", "rejected": "Отклонён", "cancelled": "Отменён",
+    "payment_failed": "Оплата не подтверждена",
 }
 # статусы, которые администратор выставляет кнопками Telegram и в админке
 ADMIN_FLOW_STATUSES = ("new", "accepted", "courier", "done", "cancelled")
@@ -1313,6 +1358,42 @@ def order_history(o):
              "at": h.get("at"), "by": h.get("by")} for h in hist]
 
 
+def order_payment(o):
+    """Блок оплаты заказа (order["payment"]) либо None у старых заказов без выбора способа оплаты."""
+    p = o.get("payment")
+    return p if isinstance(p, dict) and p.get("method") in PAY_METHOD_LABELS else None
+
+
+def is_transfer_order(o):
+    p = order_payment(o)
+    return bool(p) and p["method"] == PAY_TRANSFER
+
+
+def set_pay_status(o, status, by):
+    """Меняет статус оплаты и пишет время изменения и историю. Возвращает True, если статус изменился.
+    Вызывать под DATA_LOCK; сохранение заказа — на вызывающем."""
+    p = order_payment(o)
+    if not p or p.get("status") == status:
+        return False
+    now = _now_iso()
+    p["status"] = status
+    p["status_changed_at"] = now
+    p.setdefault("history", []).append({"status": status, "at": now, "by": by})
+    return True
+
+
+def sync_payment_status(o, target, by):
+    """Статус оплаты переводом меняется только решением администратора (статусом заказа):
+    «Принят» → оплата подтверждена, «Оплата не подтверждена» → оплата не подтверждена.
+    Автоматически по факту загрузки чека оплата никогда не подтверждается."""
+    if not is_transfer_order(o):
+        return
+    if target in ACCEPTED_STATUSES:
+        set_pay_status(o, "confirmed", by)
+    elif target == "payment_failed":
+        set_pay_status(o, "not_confirmed", by)
+
+
 def set_order_status(o, target, by):
     """Меняет статус (склад и баллы — через apply_order_status) и пишет запись в историю.
     Возвращает (текст_ошибки | None, изменился_ли_статус). Вызывать под DATA_LOCK; сохранение — на вызывающем."""
@@ -1322,6 +1403,7 @@ def set_order_status(o, target, by):
     err = apply_order_status(o, target)
     if err:
         return err, False
+    sync_payment_status(o, target, by)
     hist = o.setdefault("status_history", [])
     if not hist and old == "new" and o.get("created_at"):
         hist.append({"status": "new", "at": o["created_at"], "by": "customer"})
@@ -1339,9 +1421,17 @@ def notify_customer_status(o):
     st, oid = o.get("status"), o.get("id")
     label = STATUS_LABELS.get(st, st)
     sp, cb = int(o.get("points_spent") or 0), int(o.get("cashback") or 0)
-    if st == "accepted":
+    if st == "accepted" and is_transfer_order(o):
+        text = (f"✅ Оплата подтверждена, заказ CD-{oid} принят!\n\nМы свяжемся с вами в этом чате."
+                + (f"\nНачислен кешбэк: {cb} б." if cb else ""))
+    elif st == "accepted":
         text = (f"✅ Ваш заказ CD-{oid} принят!\n\nМы свяжемся с вами в этом чате."
                 + (f"\nНачислен кешбэк: {cb} б." if cb else ""))
+    elif st == "payment_failed":
+        text = (f"❌ Оплата заказа CD-{oid} не подтверждена, заказ не принят."
+                + (f"\nСписанные баллы ({sp} б.) возвращены." if sp else "")
+                + "\nЕсли вы уже перевели деньги — напишите менеджеру"
+                + (f" {PAY_MANAGER}" if PAY_MANAGER else "") + " и приложите чек.")
     elif st == "courier":
         text = f"🚚 Ваш заказ CD-{oid} передан курьеру."
     elif st == "done":
@@ -1374,12 +1464,17 @@ def status_keyboard(order):
     return kb
 
 
-def order_keyboard(order_id):
+def order_keyboard(order_id, transfer=False):
     kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("✅ Принять", callback_data=f"ord:ok:{order_id}"),
-        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"ord:no:{order_id}"),
-    )
+    if transfer:
+        # оплата переводом: решение по чеку принимает только администратор
+        kb.row(types.InlineKeyboardButton("☑ Принять заказ / оплата подтверждена", callback_data=f"ord:ok:{order_id}"))
+        kb.row(types.InlineKeyboardButton("❌ Отклонить оплату", callback_data=f"ord:no:{order_id}"))
+    else:
+        kb.row(
+            types.InlineKeyboardButton("✅ Принять", callback_data=f"ord:ok:{order_id}"),
+            types.InlineKeyboardButton("❌ Отклонить", callback_data=f"ord:no:{order_id}"),
+        )
     return kb
 
 
@@ -1416,8 +1511,13 @@ def on_order_moderation(call: types.CallbackQuery):
             bot.answer_callback_query(call.id, "Этот заказ уже обработан")
             finish(f"ℹ️ Уже обработан: {ORDER_STATUS_TEXT.get(order.get('status'), order.get('status'))}")
             return
+        transfer = is_transfer_order(order)
         try:
-            err, _changed = set_order_status(order, "accepted" if action == "ok" else "rejected", "telegram")
+            if action == "ok":
+                target = "accepted"
+            else:
+                target = "payment_failed" if transfer else "rejected"      # перевод: «Оплата не подтверждена»
+            err, _changed = set_order_status(order, target, "telegram")
             if not err:
                 save_orders(orders)
         except Exception:
@@ -1431,9 +1531,10 @@ def on_order_moderation(call: types.CallbackQuery):
 
     bot.answer_callback_query(call.id, "Готово")
     if accepted:
-        finish("📌 Статус: Принят", status_keyboard(order))     # дальше — кнопки «Передан курьеру / Выполнен / Отменён»
+        # дальше — кнопки «Передан курьеру / Выполнен / Отменён»
+        finish("📌 Статус: Принят" + ("\n💳 Оплата подтверждена" if transfer else ""), status_keyboard(order))
     else:
-        finish("❌ Заказ отклонён")
+        finish("❌ Оплата не подтверждена, заказ закрыт" if transfer else "❌ Заказ отклонён")
     notify_customer_status(order)
 
 
@@ -1790,7 +1891,7 @@ def public_config():
     return jsonify({"contact": SHOP_CONTACT, "channel_url": CHANNEL_URL, "reviews_url": REVIEWS_URL, "delivery_fee": DELIVERY_FEE,
                     "free_delivery_from": FREE_DELIVERY_FROM, "pickup_points": PICKUP_POINTS,
                     "cashback_percent": CASHBACK_PERCENT, "max_points_percent": MAX_POINTS_PERCENT,
-                    "point_value": POINT_VALUE})
+                    "point_value": POINT_VALUE, "payment_info": payment_info()})
 
 
 @app.route("/api/districts", methods=["GET"])
@@ -1874,8 +1975,9 @@ def products():
     return resp
 
 
-def parse_delivery(raw):
-    """Проверяет блок доставки из заказа и возвращает (delivery, error)."""
+def parse_delivery(raw, pay_method=None):
+    """Проверяет блок доставки из заказа и возвращает (delivery, error).
+    pay_method — выбранный способ оплаты (transfer | cash); для района он должен быть разрешён."""
     raw = raw if isinstance(raw, dict) else {}
     mode = raw.get("mode")
     if mode not in ("pickup", "delivery"):
@@ -1910,7 +2012,7 @@ def parse_delivery(raw):
             d["fee"] = d["district_fee"]
             # способ оплаты: только из разрешённых для района
             allowed = allowed_payments(dist)
-            pm = str(raw.get("payment_method") or "").strip()
+            pm = METHOD_TO_DISTRICT_PAY.get(pay_method) or str(raw.get("payment_method") or "").strip()
             if not pm and len(allowed) == 1:
                 pm = allowed[0]
             if not pm:
@@ -1940,8 +2042,6 @@ def delivery_text(d):
         fee_txt = fmt_price(d["fee"]) if d.get("fee") else "бесплатно"
         line = (f"🚚 Доставка ({fee_txt}): "
                 + (f"{d['district']}, " if d.get("district") else "") + f"{d.get('address') or '—'}")
-        if d.get("payment_method"):
-            line += f"\n💳 Оплата: {PAYMENT_LABELS.get(d['payment_method'], d['payment_method'])}"
     else:
         line = f"📍 Самовывоз: {d.get('point') or '—'}"
     if d.get("asap", True):
@@ -1953,6 +2053,283 @@ def delivery_text(d):
             day = d.get("date") or ""
         when = f"🕒 {day} в {d.get('time') or ''}"
     return line + "\n" + when
+
+
+def payment_info():
+    """Реквизиты для перевода (для мини-приложения и сообщений бота)."""
+    return {"phone": PAY_PHONE, "bank": PAY_BANK, "alt": PAY_ALT, "manager": PAY_MANAGER}
+
+
+def requisites_text(total):
+    """Блок реквизитов и суммы к оплате для сообщения клиенту."""
+    lines = ["💳 Оплата переводом по реквизитам", f"Сумма к оплате: {fmt_price(total)}"]
+    if PAY_PHONE:
+        lines.append(f"Номер: {PAY_PHONE}")
+    if PAY_BANK:
+        lines.append(f"Банк: {PAY_BANK}")
+    if PAY_ALT:
+        lines.append(f"Также доступен вариант: {PAY_ALT}")
+    if PAY_MANAGER:
+        lines.append(f"Менеджер: {PAY_MANAGER}")
+    return "\n".join(lines)
+
+
+def payment_line(o):
+    p = order_payment(o)
+    if not p:
+        return ""
+    line = f"💳 Оплата: {PAY_METHOD_LABELS[p['method']]}"
+    if p["method"] == PAY_TRANSFER:
+        line += f" — {PAY_STATUS_LABELS.get(p.get('status'), p.get('status'))}"
+    return line
+
+
+def order_text_blocks(o):
+    """Общие куски текста заказа для сообщений клиенту и администратору (считаются по сохранённому заказу)."""
+    delivery = o.get("delivery") or {}
+    subtotal, discount = o.get("subtotal") or 0, o.get("discount") or 0
+    discount_line = ""
+    if discount > 0:
+        discount_line = (f"Сумма товаров: {fmt_price(subtotal)}\n"
+                         f"Промокод: {o.get('promo_code')} (−{fmt_price(discount)})\n")
+    fee_line = ""
+    if delivery.get("mode") == "delivery":
+        fee_line = f"Доставка: {fmt_price(delivery['fee']) if delivery.get('fee') else 'бесплатно'}\n"
+    spent, cb = int(o.get("points_spent") or 0), int(o.get("cashback") or 0)
+    loyalty_line = (f"Оплачено баллами: {spent} б. ({fmt_price(o.get('points_discount') or 0)}) | "
+                    f"Кешбэк после подтверждения: {cb} б. ({fmt_price(cb * POINT_VALUE)})\n")
+    return {
+        "items": "\n".join(order_item_line(i) for i in (o.get("items") or [])),
+        "delivery": delivery_text(delivery),
+        "discount": discount_line, "fee": fee_line, "loyalty": loyalty_line,
+    }
+
+
+def admin_order_text(o, header="🛒 Новый заказ"):
+    """Текст заказа для администратора: клиент, состав, сумма, способ оплаты."""
+    b = order_text_blocks(o)
+    by_id = {p.get("id"): p for p in load_products()}
+
+    def where(i):       # для менеджера — с категорией и серией, т.к. названия вкусов повторяются в разных линейках
+        try:
+            p = by_id.get(int(i.get("id")))
+        except (TypeError, ValueError):
+            p = None
+        return " → ".join(x for x in (p.get("category"), p.get("subcategory")) if x) if p else ""
+
+    items = "\n".join(order_item_line(i) + (f"\n   📁 {where(i)}" if where(i) else "")
+                      for i in (o.get("items") or []))
+    pay = payment_line(o)
+    if is_transfer_order(o):
+        tail = ("\nТовар спишется со склада только после нажатия «Принять заказ». "
+                "Оплата автоматически не подтверждается — сверьте чек с поступлением денег.")
+    else:
+        tail = "\nТовар спишется со склада после нажатия «Принять»."
+    return (
+        f"{header} CD-{o.get('id')}\n\n"
+        f"Клиент: {o.get('name')}\n"
+        f"Телефон: {o.get('phone')}\n"
+        + (f"Telegram: @{o['customer_username']}\n" if o.get("customer_username") else "")
+        + f"\n{items}\n\n"
+        f"{b['delivery']}\n"
+        + (f"{pay}\n" if pay else "")
+        + "\n"
+        f"{b['discount']}{b['fee']}{b['loyalty']}"
+        f"Итого: {fmt_price(o.get('total') or 0)}\n"
+        + (f"\nКомментарий: {o['comment']}\n" if o.get("comment") else "")
+        + tail
+    )
+
+
+def sniff_receipt(raw):
+    """Тип файла определяем по содержимому, а не по имени и заголовкам клиента."""
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg", "jpg"
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", "png"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if raw[:5] == b"%PDF-":
+        return "application/pdf", "pdf"
+    return None, None
+
+
+def notify_admins_receipt(o, raw, ctype, fname):
+    """Администратору: сначала чек (фото/файл), затем заказ с кнопками. Решение принимает только администратор."""
+    oid = o.get("id")
+    if not ADMIN_CHAT_IDS:
+        log.warning("ADMIN_CHAT_ID не задан — некому отправить чек по заказу CD-%s", oid)
+    for admin_id in ADMIN_CHAT_IDS:
+        sent = False
+        caption = f"🧾 Чек к заказу CD-{oid} · {fmt_price(o.get('total') or 0)}"
+        try:
+            if ctype in ("image/jpeg", "image/png"):
+                try:
+                    f = io.BytesIO(raw)
+                    f.name = fname
+                    bot.send_photo(admin_id, f, caption=caption)
+                    sent = True
+                except Exception as e:
+                    log.warning("Фото чека не ушло как фото (%s), отправляю файлом", e)
+            if not sent:
+                f = io.BytesIO(raw)
+                f.name = fname
+                bot.send_document(admin_id, f, caption=caption, visible_file_name=fname)
+                sent = True
+        except Exception as e:
+            log.warning("Не удалось переслать чек администратору %s: %s", admin_id, e)
+        text = admin_order_text(o, "💳 Заказ с оплатой переводом")
+        if not sent:
+            text += "\n\n⚠️ Чек не удалось переслать в Telegram — откройте его в админ-панели (вкладка «Заказы»)."
+        try:
+            bot.send_message(admin_id, text, reply_markup=order_keyboard(oid, transfer=True))
+        except Exception as e:
+            log.warning("Не удалось уведомить администратора %s: %s", admin_id, e)
+
+
+def attach_receipt(oid, raw, uploaded_by, source):
+    """Сохраняет чек в базе, переводит оплату в «Чек получен, ожидает проверки» и отправляет заказ
+    администратору. Оплата НЕ подтверждается — это решает администратор кнопкой.
+    Возвращает (заказ, None) либо (None, текст_ошибки)."""
+    if not raw:
+        return None, "Файл пустой"
+    if len(raw) > RECEIPT_MAX_BYTES:
+        return None, f"Файл слишком большой (до {RECEIPT_MAX_BYTES // (1024 * 1024)} МБ)"
+    ctype, ext = sniff_receipt(raw)
+    if not ctype:
+        return None, "Поддерживаются фото (JPG, PNG, WEBP) и PDF"
+    with DATA_LOCK:
+        orders = load_orders()
+        o = next((x for x in orders if x.get("id") == oid), None)
+        if o is None:
+            return None, "Заказ не найден"
+        p = order_payment(o)
+        if not p or p["method"] != PAY_TRANSFER:
+            return None, "Для этого заказа чек не нужен"
+        if o.get("status") not in PENDING_STATUSES:
+            return None, "Заказ уже обработан — чек не нужен"
+        if p.get("status") != "awaiting_receipt":
+            return None, "Чек по этому заказу уже отправлен — ждите подтверждения менеджера"
+        fname = f"receipt-CD{oid}.{ext}"
+        with DocSession() as db:
+            try:
+                rec = PaymentReceipt(order_id=oid, filename=fname, content_type=ctype, size=len(raw),
+                                     data=raw, uploaded_by=uploaded_by)
+                db.add(rec)
+                db.commit()
+                rid = rec.id
+            except Exception:
+                db.rollback()
+                raise
+        p["receipt_id"], p["receipt_name"], p["receipt_at"], p["receipt_source"] = rid, fname, _now_iso(), source
+        set_pay_status(o, "pending", source)
+        o["admin_notified"] = True
+        save_orders(orders)
+    notify_admins_receipt(o, raw, ctype, fname)
+    return o, None
+
+
+def _is_order_owner(o):
+    """Владелец заказа: либо одноразовый токен из ответа на оформление, либо подписанный initData Telegram."""
+    token = request.form.get("token") or request.headers.get("X-Order-Token") or ""
+    if token and o.get("receipt_token") and hmac.compare_digest(str(token), str(o["receipt_token"])):
+        return True
+    user = verify_telegram_init_data(request.headers.get("X-Telegram-Init-Data", ""))
+    return bool(user and o.get("customer_chat_id") and user["id"] == o["customer_chat_id"])
+
+
+@app.route("/api/orders/<int:oid>/receipt", methods=["POST"])
+def upload_receipt(oid):
+    """Клиент прикрепляет фото/файл чека к заказу с оплатой переводом (multipart: file, token)."""
+    order = next((o for o in load_orders() if o.get("id") == oid), None)
+    if order is None:
+        abort(404, description="Заказ не найден")
+    if not _is_order_owner(order):
+        abort(403, description="Не удалось подтвердить, что это ваш заказ. "
+                               "Закройте магазин и откройте его заново из Telegram.")
+    f = request.files.get("file")
+    if f is None:
+        abort(400, description="Прикрепите фото или файл чека")
+    updated, err = attach_receipt(oid, f.read(RECEIPT_MAX_BYTES + 1), order.get("customer_chat_id"), "app")
+    if err:
+        abort(400, description=err)
+    if updated.get("customer_chat_id"):
+        try:
+            bot.send_message(updated["customer_chat_id"],
+                             f"🧾 Чек по заказу CD-{oid} получен и передан менеджеру на проверку.\n"
+                             "Как только оплата будет подтверждена, мы сообщим вам в этом чате.")
+        except Exception as e:
+            log.warning("Не удалось подтвердить клиенту получение чека: %s", e)
+    return jsonify(public_order(updated))
+
+
+@app.route("/api/admin/orders/<int:oid>/receipt", methods=["GET"])
+def admin_get_receipt(oid):
+    """Чек заказа для администратора (только с паролем админки; публично чеки не отдаются)."""
+    require_admin()
+    with DocSession() as db:
+        rec = (db.query(PaymentReceipt).filter(PaymentReceipt.order_id == oid)
+               .order_by(PaymentReceipt.id.desc()).first())
+        if rec is None:
+            abort(404, description="Чек не найден")
+        data, ctype, fname = rec.data, rec.content_type, rec.filename
+    resp = Response(data, mimetype=ctype)
+    resp.headers["Content-Disposition"] = f'inline; filename="{fname}"'
+    resp.headers["Cache-Control"] = "private, no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+_CD_RE = re.compile(r"(?:CD-?)?(\d{1,9})", re.IGNORECASE)
+
+
+@bot.message_handler(content_types=["photo", "document"])
+def on_receipt_in_chat(message: types.Message):
+    """Чек, присланный боту в чат (фото или файл): прикрепляется к заказу клиента, ожидающему чек."""
+    uid = message.from_user.id if message.from_user else None
+    if not uid:
+        return
+    with DATA_LOCK:
+        waiting = [o for o in load_orders()
+                   if o.get("customer_chat_id") == uid and is_transfer_order(o)
+                   and o.get("status") in PENDING_STATUSES
+                   and order_payment(o).get("status") == "awaiting_receipt"]
+    if not waiting:
+        bot.send_message(message.chat.id, "Сейчас нет заказов, которые ждут чек. "
+                                          "Оформите заказ в магазине и выберите оплату переводом по реквизитам.")
+        return
+    target = None
+    m = _CD_RE.search(message.caption or "")
+    if m:
+        target = next((o for o in waiting if o.get("id") == int(m.group(1))), None)
+    if target is None and len(waiting) == 1:
+        target = waiting[0]
+    if target is None:
+        ids = ", ".join(f"CD-{o['id']}" for o in sorted(waiting, key=lambda x: x["id"]))
+        bot.send_message(message.chat.id, f"Ждут чек несколько заказов: {ids}.\n"
+                                          "Отправьте файл ещё раз и укажите номер заказа в подписи, например CD-"
+                                          f"{waiting[0]['id']}.")
+        return
+    if message.photo:
+        f_id, f_size = message.photo[-1].file_id, message.photo[-1].file_size
+    else:
+        f_id, f_size = message.document.file_id, message.document.file_size
+    if f_size and f_size > RECEIPT_MAX_BYTES:
+        bot.send_message(message.chat.id, f"Файл слишком большой (до {RECEIPT_MAX_BYTES // (1024 * 1024)} МБ).")
+        return
+    try:
+        raw = bot.download_file(bot.get_file(f_id).file_path)
+    except Exception as e:
+        log.warning("Не удалось скачать чек из Telegram: %s", e)
+        bot.send_message(message.chat.id, "Не удалось получить файл. Попробуйте отправить чек ещё раз.")
+        return
+    updated, err = attach_receipt(target["id"], raw, uid, "bot")
+    if err:
+        bot.send_message(message.chat.id, err)
+        return
+    bot.send_message(message.chat.id,
+                     f"🧾 Чек по заказу CD-{updated['id']} получен и передан менеджеру на проверку.\n"
+                     "Как только оплата будет подтверждена, мы сообщим вам в этом чате.")
 
 
 @app.route("/api/order", methods=["POST"])
@@ -1977,7 +2354,16 @@ def create_order():
         except (TypeError, ValueError):
             abort(400, description="Некорректное количество товара")
 
-    delivery, delivery_err = parse_delivery(data.get("delivery"))
+    # способ оплаты: transfer (перевод по реквизитам) или cash (наличные при встрече)
+    raw_delivery = data.get("delivery") if isinstance(data.get("delivery"), dict) else {}
+    pay_method = str(data.get("pay_method") or "").strip()
+    if pay_method not in PAY_METHOD_LABELS:       # клиент старой версии: берём из настройки района
+        pay_method = DISTRICT_PAY_TO_METHOD.get(str(raw_delivery.get("payment_method") or "").strip(), "")
+    if pay_method not in PAY_METHOD_LABELS:
+        abort(400, description="Выберите способ оплаты")
+    is_transfer = pay_method == PAY_TRANSFER
+
+    delivery, delivery_err = parse_delivery(data.get("delivery"), pay_method)
     if delivery_err:
         abort(400, description=delivery_err)
 
@@ -2069,9 +2455,11 @@ def create_order():
 
     orders = load_orders()
     new_id = (max([o.get("id", 0) for o in orders], default=0) + 1)
+    created_iso = datetime.now(timezone.utc).isoformat()
+    pay_status = "awaiting_receipt" if is_transfer else "cash"
     order = {
         "id": new_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_iso,
         "name": name,
         "phone": phone,
         "comment": comment,
@@ -2094,7 +2482,17 @@ def create_order():
         "cashback": cashback,
         "loyalty_applied": bool(customer_chat_id),
         "messages": [],
+        # оплата: способ, статус, время изменения статуса и ссылка на чек (сам чек — в таблице payment_receipts)
+        "payment": {
+            "method": pay_method, "status": pay_status, "status_changed_at": created_iso,
+            "history": [{"status": pay_status, "at": created_iso, "by": "customer"}],
+            "receipt_id": None, "receipt_name": None, "receipt_at": None,
+        },
+        # по переводу администратор узнаёт о заказе только после получения чека
+        "admin_notified": not is_transfer,
     }
+    if is_transfer:
+        order["receipt_token"] = uuid.uuid4().hex      # нужен, чтобы прикрепить чек к этому заказу
     orders.append(order)
     save_orders(orders)
 
@@ -2105,78 +2503,48 @@ def create_order():
                 p["used_count"] = int(p.get("used_count") or 0) + 1
         save_promos(promos)
 
-    items_lines = "\n".join(order_item_line(i) for i in items)
-    # для менеджера — с категорией и серией, т.к. названия вкусов повторяются в разных линейках
-    _by_id = {p.get("id"): p for p in load_products()}
-    def _where(i):
-        try:
-            p = _by_id.get(int(i.get("id")))
-        except (TypeError, ValueError):
-            p = None
-        return " → ".join(x for x in (p.get("category"), p.get("subcategory")) if x) if p else ""
-    admin_items_lines = "\n".join(
-        order_item_line(i)
-        + (f"\n   📁 {_where(i)}" if _where(i) else "")
-        for i in items
-    )
-
-    delivery_block = delivery_text(delivery)
-    if delivery["mode"] == "delivery":
-        fee_line = f"Доставка: {fmt_price(delivery['fee']) if delivery['fee'] else 'бесплатно'}\n"
-    else:
-        fee_line = ""
-    loyalty_line = (f"Оплачено баллами: {points_to_spend} б. ({fmt_price(points_discount)}) | "
-                    f"Кешбэк после подтверждения: {cashback} б. ({fmt_price(cashback * POINT_VALUE)})\n")
-
-    discount_line = ""
-    if discount > 0:
-        discount_line = (
-            f"Сумма товаров: {fmt_price(subtotal)}\n"
-            f"Промокод: {promo.get('code')} (−{fmt_price(discount)})\n"
-        )
+    blocks = order_text_blocks(order)
+    pay_line = payment_line(order)
 
     if customer_chat_id:
-        try:
-            bot.send_message(
-                customer_chat_id,
-                "✅ Заказ оформлен!\n\n"
+        head = ("✅ Заказ оформлен!\n\n" if not is_transfer else "✅ Заказ создан, осталось оплатить!\n\n")
+        body = (f"{head}"
                 f"Номер заказа: CD-{new_id}\n"
-                f"{items_lines}\n\n"
-                f"{delivery_block}\n\n"
-                f"{discount_line}"
-                f"{fee_line}"
-                f"{loyalty_line}"
-                f"Итого: {fmt_price(total)}\n\n"
-                "Заказ в обработке. Как только менеджер его примет, мы сообщим вам в этом чате."
-            )
+                f"{blocks['items']}\n\n"
+                f"{blocks['delivery']}\n"
+                f"{pay_line}\n\n"
+                f"{blocks['discount']}{blocks['fee']}{blocks['loyalty']}"
+                f"Итого: {fmt_price(total)}\n\n")
+        if is_transfer:
+            body += (requisites_text(total) + "\n\n"
+                     "📎 Отправьте чек (фото или файл) прямо в этот чат — можно подписать номером заказа — "
+                     "или прикрепите его в магазине: Профиль → заказ. "
+                     "Менеджер проверит оплату и подтвердит заказ. Автоматически оплата не подтверждается.")
+        else:
+            body += "Оплата наличными при встрече. Заказ в обработке — как только менеджер его примет, мы сообщим вам в этом чате."
+        try:
+            bot.send_message(customer_chat_id, body)
         except Exception as e:
             log.warning("Не удалось отправить подтверждение покупателю: %s", e)
 
-    admin_text = (
-        f"🛒 Новый заказ CD-{new_id}\n\n"
-        f"Клиент: {name}\n"
-        f"Телефон: {phone}\n"
-        + (f"Telegram: @{customer_username}\n" if customer_username else "")
-        + f"\n{admin_items_lines}\n\n"
-        f"{delivery_block}\n\n"
-        f"{discount_line}"
-        f"{fee_line}"
-        f"{loyalty_line}"
-        f"Итого: {fmt_price(total)}\n"
-        + (f"\nКомментарий: {comment}\n" if comment else "")
-        + "\nТовар спишется со склада после нажатия «Принять»."
-    )
-    kb = order_keyboard(new_id)
-    for admin_id in ADMIN_CHAT_IDS:
-        try:
-            bot.send_message(admin_id, admin_text, reply_markup=kb)
-        except Exception as e:
-            log.warning("Не удалось уведомить администратора %s: %s", admin_id, e)
+    if not is_transfer:
+        # наличные: заказ сразу уходит администратору с кнопками «Принять / Отклонить»
+        kb = order_keyboard(new_id)
+        admin_text = admin_order_text(order)
+        for admin_id in ADMIN_CHAT_IDS:
+            try:
+                bot.send_message(admin_id, admin_text, reply_markup=kb)
+            except Exception as e:
+                log.warning("Не удалось уведомить администратора %s: %s", admin_id, e)
+    # перевод: администратору заказ и чек уйдут, когда клиент пришлёт чек (attach_receipt)
 
     return jsonify({"ok": True, "order_id": new_id, "total": total, "points_spent": points_to_spend,
                     "points_discount": points_discount, "cashback": cashback, "points_balance": new_balance,
                     "delivery_fee": delivery["fee"], "district": delivery.get("district"),
-                    "payment_method": delivery.get("payment_method")}), 201
+                    "payment_method": delivery.get("payment_method"),
+                    "pay_method": pay_method, "pay_status": pay_status,
+                    "receipt_token": order.get("receipt_token"),
+                    "payment_info": payment_info() if is_transfer else None}), 201
 
 
 @app.route("/api/promo/check", methods=["POST"])
@@ -2250,7 +2618,7 @@ def customer_cancel_order(oid):
     save_orders(orders)
     notify_customer_status(order)
 
-    for admin_id in ADMIN_CHAT_IDS:
+    for admin_id in (ADMIN_CHAT_IDS if order.get("admin_notified", True) else ()):
         try:
             bot.send_message(admin_id, f"❌ Клиент отменил заказ CD-{oid}")
         except Exception as e:
@@ -3355,6 +3723,7 @@ def webhook():
 
 @app.errorhandler(400)
 @app.errorhandler(401)
+@app.errorhandler(413)
 @app.errorhandler(403)
 @app.errorhandler(404)
 def handle_api_errors(err):
