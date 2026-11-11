@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: clouds-in-demu-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 60
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      # Telegram-аккаунт менеджера без @ (кнопка «Написать менеджеру»). Пусто — кнопка скрыта.
+      - key: SHOP_CONTACT
+        sync: false
+      # Ссылки на канал CLOUDS IN DEMU и канал с отзывами. Пусто — кнопки скрыты.
+      - key: CHANNEL_URL
+        sync: false
+      - key: REVIEWS_URL
+        sync: false
+      - key: PICKUP_POINTS
+        value: ВМЗ (самовывоз)
+      - key: SHOP_TIMEZONE
+        value: Europe/Moscow
+    # Данные и фото хранятся в Neon (DATABASE_URL) — Persistent Disk не нужен.
